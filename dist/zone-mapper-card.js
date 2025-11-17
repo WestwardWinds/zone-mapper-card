@@ -172,6 +172,9 @@ class ZoneMapperCard extends HTMLElement {
     this.unitLabelSize = 18; // px
     this._gridCache = null;
     this._coneRingsCache = null;
+
+    // Preload HA editor elements used for device/entity pickers when needed.
+    this._pickerElementsLoaded = false;
   }
 
   // Default stub config
@@ -254,6 +257,7 @@ class ZoneMapperCard extends HTMLElement {
     if (firstTime && this._hass) {
       // Load device/entity registries once on first hass injection
       this._ensureRegistriesLoaded();
+      this._ensurePickerElementsLoaded();
     }
   }
 
@@ -280,7 +284,6 @@ class ZoneMapperCard extends HTMLElement {
     if (cfg && cfg.direct_entity) {
       return this.processEntityConfig(cfg.entities);
     }
-    // Default: no preconfigured pairs; user selects via dropdowns
     return [];
   }
 
@@ -409,8 +412,8 @@ class ZoneMapperCard extends HTMLElement {
             <div class="config-content ${this.showDeviceTargets ? 'open' : ''}" id="sectionDeviceTargets">
               <div class="entity-selection">
                 <div class="entity-controls">
-                  <label for="deviceSelect" class="subtle">Device</label>
-                  <select id="deviceSelect"></select>
+                  <label for="devicePicker" class="subtle">Device</label>
+                  <ha-device-picker id="devicePicker"></ha-device-picker>
                   <span class="subtle">Select the HA device that owns your X/Y sensor entities.</span>
                 </div>
                 <div id="entityPairs"></div>
@@ -720,18 +723,24 @@ class ZoneMapperCard extends HTMLElement {
       });
     }
 
-    const deviceSelect = this.shadowRoot.getElementById('deviceSelect');
-    if (deviceSelect) {
-      deviceSelect.addEventListener('change', () => {
-        this._selectedDeviceId = deviceSelect.value || null;
-        if (!this._selectedDeviceId) {
-          this.trackedEntities = [];
+    const devicePicker = this.shadowRoot.getElementById('devicePicker');
+    if (devicePicker && devicePicker.tagName === 'HA-DEVICE-PICKER') {
+      devicePicker.hass = this._hass;
+      if (this._selectedDeviceId) {
+        devicePicker.value = this._selectedDeviceId;
+      }
+      devicePicker.addEventListener('value-changed', (ev) => {
+        const newDeviceId = ev.detail?.value || null;
+        const changed = newDeviceId !== this._selectedDeviceId;
+        this._selectedDeviceId = newDeviceId;
+        if (changed) {
+          // When device changes, suggest fresh pairs and re-render entity rows.
+          if (!this._suggestPairsFromDevice(true)) {
+            this.trackedEntities = [];
+          }
           this._renderEntitySelection();
           this.drawGrid();
-          return;
         }
-        this._suggestPairsFromDevice(true);
-        this._renderEntitySelection();
       });
     }
 
@@ -1716,6 +1725,7 @@ class ZoneMapperCard extends HTMLElement {
       const xRaw = parseFloat(stateX.state);
       const yRaw = parseFloat(stateY.state);
       if (Number.isNaN(xRaw) || Number.isNaN(yRaw)) return;
+      if (xRaw === 0 && yRaw === 0) return;
       const xVal = xRaw * multiplier;
       const yVal = yRaw * multiplier;
       const rotated = rotatePoint(xVal, yVal);
@@ -2256,13 +2266,6 @@ class ZoneMapperCard extends HTMLElement {
       ]);
       this._devices = Array.isArray(devices) ? devices : [];
       this._allEntities = Array.isArray(entities) ? entities : [];
-      // Try to pick a default device for the location if any entity matches restored pairs
-      if (!this._selectedDeviceId && this.trackedEntities && this.trackedEntities.length) {
-        const info =
-          this._findEntityInfo(this.trackedEntities[0]?.x) ||
-          this._findEntityInfo(this.trackedEntities[0]?.y);
-        if (info) this._selectedDeviceId = info.device_id;
-      }
       this._renderEntitySelection();
     } catch {
       // Silently ignore; dropdowns will remain empty
@@ -2271,46 +2274,20 @@ class ZoneMapperCard extends HTMLElement {
   }
 
   _renderEntitySelection() {
-    const devSel = this.shadowRoot?.getElementById('deviceSelect');
     const pairsDiv = this.shadowRoot?.getElementById('entityPairs');
-    if (!devSel || !pairsDiv) return;
+    if (!pairsDiv) return;
 
-    // Populate device select
-    devSel.innerHTML = '';
-    const devices = this._devices || [];
-    const mkOpt = (val, label) => {
-      const o = document.createElement('option');
-      o.value = val || '';
-      o.textContent = label;
-      return o;
-    };
-    devSel.appendChild(mkOpt('', '— Select device —'));
-    devices.forEach((d) => {
-      const label = d.name_by_user || d.name || d.id;
-      const opt = mkOpt(d.id, label);
-      if (String(d.id) === String(this._selectedDeviceId)) opt.selected = true;
-      devSel.appendChild(opt);
-    });
-
-    // Build options for entities belonging to selected device (sensors only)
-    const deviceEntities = (this._allEntities || []).filter(
-      (e) => !this._selectedDeviceId || e.device_id === this._selectedDeviceId,
-    );
-    const sensorEntityIds = deviceEntities
-      .filter((e) => e.entity_id || '')
-      .map((e) => e.entity_id)
-      .sort((a, b) => a.localeCompare(b));
-
-    // Render pairs
     pairsDiv.innerHTML = '';
     const pairs = this.trackedEntities && this.trackedEntities.length ? this.trackedEntities : [];
+    const deviceId = this._selectedDeviceId || null;
+
     pairs.forEach((pair, idx) => {
       const row = document.createElement('div');
       row.className = 'entity-row';
       const label = document.createElement('label');
       label.textContent = `Target ${idx + 1}`;
-      const selX = document.createElement('select');
-      const selY = document.createElement('select');
+      const selX = document.createElement('ha-entity-picker');
+      const selY = document.createElement('ha-entity-picker');
       const rmBtn = document.createElement('button');
       rmBtn.textContent = 'Remove';
       rmBtn.addEventListener('click', () => {
@@ -2318,32 +2295,24 @@ class ZoneMapperCard extends HTMLElement {
         this._renderEntitySelection();
         this.drawGrid();
       });
-
-      const addOptions = (sel, currentVal) => {
-        sel.innerHTML = '';
-        const noneOpt = document.createElement('option');
-        noneOpt.value = '';
-        noneOpt.textContent = '— Select entity —';
-        sel.appendChild(noneOpt);
-        sensorEntityIds.forEach((id) => {
-          const o = document.createElement('option');
-          o.value = id;
-          o.textContent = id;
-          if (currentVal && id === currentVal) o.selected = true;
-          sel.appendChild(o);
+      if (selX.tagName === 'HA-ENTITY-PICKER') {
+        selX.hass = this._hass;
+        if (deviceId) selX.device = deviceId;
+        selX.value = pair.x || '';
+        selX.addEventListener('value-changed', (ev) => {
+          this.trackedEntities[idx].x = ev.detail?.value || '';
+          this.drawGrid();
         });
-      };
-      addOptions(selX, pair.x);
-      addOptions(selY, pair.y);
-
-      selX.addEventListener('change', () => {
-        this.trackedEntities[idx].x = selX.value || '';
-        this.drawGrid();
-      });
-      selY.addEventListener('change', () => {
-        this.trackedEntities[idx].y = selY.value || '';
-        this.drawGrid();
-      });
+      }
+      if (selY.tagName === 'HA-ENTITY-PICKER') {
+        selY.hass = this._hass;
+        if (deviceId) selY.device = deviceId;
+        selY.value = pair.y || '';
+        selY.addEventListener('value-changed', (ev) => {
+          this.trackedEntities[idx].y = ev.detail?.value || '';
+          this.drawGrid();
+        });
+      }
 
       row.appendChild(label);
       row.appendChild(selX);
@@ -2351,6 +2320,29 @@ class ZoneMapperCard extends HTMLElement {
       row.appendChild(rmBtn);
       pairsDiv.appendChild(row);
     });
+  }
+
+  async _ensurePickerElementsLoaded() {
+    if (this._pickerElementsLoaded || !window.loadCardHelpers) return;
+    try {
+      if (!customElements.get('ha-entity-picker')) {
+        const helpers = await window.loadCardHelpers();
+        const entitiesCard = await helpers.createCardElement({ type: 'entities', entities: [] });
+        if (entitiesCard?.constructor?.getConfigElement) {
+          entitiesCard.constructor.getConfigElement();
+        }
+      }
+      if (!customElements.get('ha-device-picker')) {
+        const helpers = await window.loadCardHelpers();
+        const entitiesCard = await helpers.createCardElement({ type: 'entities', entities: [] });
+        if (entitiesCard?.constructor?.getConfigElement) {
+          entitiesCard.constructor.getConfigElement();
+        }
+      }
+      this._pickerElementsLoaded = true;
+    } catch (e) {
+      console.debug('Zone Mapper: failed to preload HA picker elements', e);
+    }
   }
 
   _findEntityInfo(entityId) {
@@ -2371,7 +2363,6 @@ class ZoneMapperCard extends HTMLElement {
     );
     const pairs = [];
     const used = new Set();
-    // Try to pair by replacing x->y in name
     xs.forEach((xe) => {
       const guessY = xe.entity_id.replace(/x(?!.*x)/, 'y').replace(/_x(?!.*_x)/, '_y');
       const ye = list.find((e) => e.entity_id === guessY) || ys.find((e) => !used.has(e.entity_id));
